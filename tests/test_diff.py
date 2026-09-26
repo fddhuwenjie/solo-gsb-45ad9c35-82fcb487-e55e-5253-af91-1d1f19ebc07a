@@ -11,8 +11,8 @@ import urllib.request
 
 from app.diff import (
     BODY_DELETED, BODY_INSERTED, BODY_SUBSTITUTED, DELETE, INSERT, MATCH,
-    PAGINATION_SHIFT, RETRANSLATED, SUBSTITUTE, UNCHANGED, _align_core,
-    align_graphemes, compare_finalizations, grapheme_slots,
+    PAGINATION_SHIFT, RETRANSLATED, SUBSTITUTE, UNCHANGED, _OP_COST,
+    _align_core, align_graphemes, compare_finalizations, grapheme_slots,
 )
 from app.errors import InputError
 from app.graphemes import graphemes
@@ -110,6 +110,127 @@ class AlignmentTests(unittest.TestCase):
                 reference = _align_core(old_t, new_t,
                                         0, len(old_t), 0, len(new_t))
                 self.assertEqual(trimmed, reference, (old, new))
+
+    def test_long_repeated_body_with_one_changed_head_is_aligned(self):
+        # Regression: 3163 repeated 'a' whose first grapheme changes is
+        # within the body limit and costs exactly one substitution, but
+        # the old common-suffix guard abandoned trimming (the suffix text
+        # reappears in the middle), so the full table exceeded the
+        # 10_000_000-cell guard and was falsely rejected.  The banded
+        # alignment must return the untrimmed stream: one substitution at
+        # the head, every other grapheme matched one-to-one.
+        old = "a" * 3163
+        new = "c" + "a" * 3162
+        ops = align_graphemes(graphemes(old), graphemes(new))
+        self.assertEqual(ops[0], (SUBSTITUTE, 0, 0))
+        self.assertEqual(
+            [op for op in ops[1:]],
+            [(MATCH, i, i) for i in range(1, 3163)])
+
+    def test_banded_stream_is_optimal_with_canonical_tie_break(self):
+        # The band doubling is an exactness optimization, not an
+        # approximation.  For pairs large enough to force the banded
+        # path, independently recompute the full Levenshtein suffix costs
+        # in plain Python and replay the emitted stream through the
+        # ``match > substitute > delete > insert`` greedy rule: every
+        # step must be the first candidate that realizes the true suffix
+        # cost, every index consumed once per side.  Sizes stay just over
+        # the 3162*3162 quadratic threshold to keep the reference table
+        # cheap.
+        n = 3200
+
+        def banded(oldt, newt):
+            from app.diff import _align_large
+            return _align_large(oldt, newt, 0, len(oldt),
+                                0, len(newt))
+
+        cases = [
+            ["c"] + ["a"] * (n - 1),    # reported regression shape
+            ["a"] * (n - 9),            # tail truncation / band rim
+        ]
+        for newt in cases:
+            ops = banded(["a"] * n, newt)
+            self._assert_canonical_optimal(ops, ["a"] * n, newt)
+
+    def test_banded_stream_random_fuzz_above_guard(self):
+        # Near-identical pairs (a handful of random edits on repetitious
+        # bodies) sized just over the quadratic threshold, including
+        # length offsets that hit the band boundary logic.  Their true
+        # distance is small, so the banded path must succeed and reproduce
+        # the canonical stream; a fully random pair would be a genuine
+        # high-divergence input and is covered separately.
+        rng = random.Random(99)
+        for n, alpha, edits in ((3200, "ab", 6),):
+            base = [rng.choice(alpha) for _ in range(n)]
+            newt = list(base)
+            for _ in range(edits):
+                kind = rng.choice("sdi")
+                pos = rng.randrange(len(newt) or 1)
+                if kind == "s" and newt:
+                    newt[pos] = rng.choice(alpha)
+                elif kind == "d" and newt:
+                    del newt[pos]
+                else:
+                    newt.insert(pos, rng.choice(alpha))
+            from app.diff import _align_large
+            ops = _align_large(base, newt, 0, len(base), 0, len(newt))
+            self._assert_canonical_optimal(ops, base, newt)
+
+    def _assert_canonical_optimal(self, ops, oldt, newt):
+        n, m = len(oldt), len(newt)
+        # Independent Levenshtein suffix table, plain Python.
+        rest = [[0] * (m + 1) for _ in range(n + 1)]
+        for i in range(n + 1):
+            rest[i][m] = n - i
+        for j in range(m + 1):
+            rest[n][j] = m - j
+        for i in range(n - 1, -1, -1):
+            for j in range(m - 1, -1, -1):
+                pair = 0 if oldt[i] == newt[j] else 1
+                rest[i][j] = min(rest[i + 1][j + 1] + pair,
+                                 rest[i + 1][j] + 1,
+                                 rest[i][j + 1] + 1)
+        i = j = 0
+        seen_old, seen_new = [], []
+        for op, oi, ni in ops:
+            self.assertEqual((oi, ni),
+                             (i if op != INSERT else None,
+                              j if op != DELETE else None))
+            candidates = []
+            if i < n and j < m:
+                name = MATCH if oldt[i] == newt[j] else SUBSTITUTE
+                candidates.append((name, i + 1, j + 1))
+            if i < n:
+                candidates.append((DELETE, i + 1, j))
+            if j < m:
+                candidates.append((INSERT, i, j + 1))
+            total = rest[i][j]
+            expected = next(
+                (name for name, x, y in candidates
+                 if _OP_COST[name] + rest[x][y] == total), None)
+            self.assertIsNotNone(expected)
+            self.assertEqual(op, expected)
+            if oi is not None:
+                seen_old.append(oi)
+            if ni is not None:
+                seen_new.append(ni)
+            if op in (MATCH, SUBSTITUTE, DELETE):
+                i += 1
+            if op in (MATCH, SUBSTITUTE, INSERT):
+                j += 1
+        self.assertEqual((i, j), (n, m))
+        self.assertEqual(seen_old, list(range(n)))
+        self.assertEqual(seen_new, list(range(m)))
+
+    def test_genuinely_unrelated_huge_pair_is_still_rejected(self):
+        # Resource protection is preserved: a high-distance pair this far
+        # over the cell guard cannot sneak through the banded path.
+        n = m = 4000
+        rng = random.Random(7)
+        oldt = [chr(65 + rng.randrange(26)) for _ in range(n)]
+        newt = [chr(65 + rng.randrange(26)) for _ in range(m)]
+        with self.assertRaises(InputError):
+            _align_core(oldt, newt, 0, n, 0, m)
 
 
 class CompareTests(unittest.TestCase):
