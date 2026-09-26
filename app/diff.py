@@ -20,7 +20,12 @@ The comparison proceeds in two stages:
    alignments the lexicographically first operation stream is chosen,
    ordered ``match > substitute > delete > insert``; the same
    suffix-DP-plus-greedy-walk construction as the readback verifier is
-   used, so repeated text yields a stable alignment.
+   used, so repeated text yields a stable alignment.  The suffix DP is
+   exact but not always materialized in full: after common-affix
+   trimming, a middle too large for the whole table is evaluated inside
+   a diagonal band whose width follows the edit distance, so long
+   near-identical revisions align in a few table cells per grapheme
+   while the emitted stream stays identical to the full-table walk.
 
 2. **Per-paired-grapheme classification.**  Every matched grapheme is
    examined on both sides:
@@ -75,11 +80,21 @@ _CHANGE_KINDS = frozenset({
 
 _OP_COST = {MATCH: 0, SUBSTITUTE: 1, DELETE: 1, INSERT: 1}
 
-# Memory guard for the exact suffix-DP table: at most this many table
-# entries (4 bytes each).  Common-prefix/suffix trimming handles the
-# ordinary near-identical-revision case; this only rejects pathological
-# full-document rewrites of two unrelated huge texts.
+# Memory guard for the exact alignment tables, counted in 4-byte table
+# entries.  A middle whose full suffix table fits (n * m cells) is
+# aligned in one exact pass, as before.  Larger middles switch to an
+# exact diagonal-band suffix DP whose band only needs to cover every
+# minimum-cost alignment: a half-width of k (the edit distance) always
+# suffices, so near-identical revisions align in a few cells per
+# grapheme no matter how long the bodies are, while genuinely divergent
+# long texts still outgrow the guard (their band widens with the edit
+# distance) and keep being rejected.
 MAX_TABLE_CELLS = 10_000_000
+
+# "Outside the band" sentinel: larger than any real alignment cost (a
+# cost never exceeds max(n, m)) and small enough that _INF + 1 still
+# fits a signed 32-bit table entry.
+_INF = 1 << 30
 
 
 # --------------------------------------------------------------------------
@@ -105,7 +120,9 @@ def align_graphemes(old_clusters, new_clusters):
     match earlier (old ``aa`` vs new ``acaba``), and the trim is
     abandoned instead.  Either way the emitted stream is exactly the one
     the untrimmed suffix-DP-plus-greedy-walk would produce; trimming only
-    keeps the quadratic table small for near-identical revisions.
+    keeps the middle small for near-identical revisions, and an oversized
+    middle is itself aligned exactly inside a diagonal band (see
+    ``_align_core``).
     """
     old_texts = [cluster[0] for cluster in old_clusters]
     new_texts = [cluster[0] for cluster in new_clusters]
@@ -142,28 +159,158 @@ def align_graphemes(old_clusters, new_clusters):
 
 
 def _align_core(a, b, lo_n, hi_n, lo_m, hi_m):
-    """Suffix-table DP + greedy walk on ``a[lo_n:hi_n]`` / ``b[lo_m:hi_m]``.
+    """Exact minimum-edit alignment of ``a[lo_n:hi_n]`` / ``b[lo_m:hi_m]``.
 
     ``a`` and ``b`` are grapheme-*text* lists; returned indices are
     offsets into them (i.e. the real per-side cluster indices).
+
+    The construction is a suffix-cost DP plus a greedy walk that takes,
+    at every position, the first operation in the ``match > substitute >
+    delete > insert`` order whose remainder realizes the optimum.  When
+    the full ``n * m`` table fits the cell guard it is computed
+    directly; otherwise the same DP is evaluated inside a diagonal band
+    ``|(n - i) - (m - j)| <= w`` whose half-width is doubled from a
+    cheap lower bound until the banded ``rest(0, 0)`` is provably exact.
+    Every minimum-cost alignment stays inside a band of half-width k
+    (the edit distance), and every banded cell whose true cost is at
+    most w holds the exact value, so the walk -- and therefore the
+    emitted stream -- is identical to the untrimmed full-table walk.
+    Only the memory shape changes: near-identical long revisions align
+    in O((n + m) * k) cells, while two genuinely divergent long texts
+    still exceed the guard and raise :class:`InputError`.
     """
     n, m = hi_n - lo_n, hi_m - lo_m
-    if n * m > MAX_TABLE_CELLS:
-        raise InputError(
-            "revisions differ too much to align "
-            f"({n} x {m} graphemes exceeds the {MAX_TABLE_CELLS}-cell limit)")
-    rest = [array("i", [0]) * (m + 1) for _ in range(n + 1)]
-    for i in range(n + 1):
-        rest[i][m] = n - i
-    for j in range(m + 1):
-        rest[n][j] = m - j
-    for i in range(n - 1, -1, -1):
-        row, nxt = rest[i], rest[i + 1]
-        ai = a[lo_n + i]
-        for j in range(m - 1, -1, -1):
-            pair = 0 if ai == b[lo_m + j] else 1
-            row[j] = min(nxt[j + 1] + pair, nxt[j] + 1, row[j + 1] + 1)
+    if n * m <= MAX_TABLE_CELLS:
+        # Historical fast path: the full suffix table fits the guard, so
+        # compute it in one exact pass (a band wide enough to be the
+        # whole table).
+        rows, j_lo = _banded_suffix_table(a, b, lo_n, lo_m, n, m,
+                                          max(n, m))
+    else:
+        w = _distance_lower_bound(a, b, lo_n, hi_n, lo_m, hi_m)
+        while True:
+            if _band_cells(n, m, w) > MAX_TABLE_CELLS:
+                raise InputError(
+                    "revisions differ too much to align "
+                    f"(edit distance over {n} x {m} graphemes needs a "
+                    f"band beyond the {MAX_TABLE_CELLS}-cell limit)")
+            rows, j_lo = _banded_suffix_table(a, b, lo_n, lo_m, n, m, w)
+            if _cell(rows, j_lo, 0, 0) <= w:
+                break  # the true distance is at most w: value is exact
+            w *= 2
+    return _walk(a, b, lo_n, lo_m, n, m, rows, j_lo)
 
+
+def _distance_lower_bound(a, b, lo_n, hi_n, lo_m, hi_m):
+    """Cheap exact lower bound (>= 1) for the edit distance.
+
+    The length gap is one bound; the per-text grapheme counts give
+    another: every edit operation changes the count imbalance of any
+    grapheme text by at most one, so the distance is at least the
+    largest imbalance.  Starting the band doubling at this bound never
+    skips the true distance and rejects divergent inputs before any DP
+    work.
+    """
+    counts = {}
+    for i in range(lo_n, hi_n):
+        text = a[i]
+        counts[text] = counts.get(text, 0) + 1
+    for j in range(lo_m, hi_m):
+        text = b[j]
+        counts[text] = counts.get(text, 0) - 1
+    bound = abs((hi_n - lo_n) - (hi_m - lo_m))
+    for delta in counts.values():
+        if delta < 0:
+            delta = -delta
+        if delta > bound:
+            bound = delta
+    return max(1, bound)
+
+
+def _band_cells(n, m, w):
+    """Number of stored table entries for a half-width-``w`` band."""
+    total = 0
+    base = m - n
+    for i in range(n + 1):
+        lo = base + i - w
+        if lo < 0:
+            lo = 0
+        hi = base + i + w
+        if hi > m:
+            hi = m
+        total += hi - lo + 1
+    return total
+
+
+def _banded_suffix_table(a, b, lo_n, lo_m, n, m, w):
+    """Banded suffix-cost table for ``a[lo_n:lo_n+n]``/``b[lo_m:lo_m+m]``.
+
+    Returns ``(rows, j_lo)`` where ``rows[i]`` holds ``rest(i, j)`` --
+    the minimum cost of aligning the two suffixes starting at ``i`` and
+    ``j`` -- for the columns ``j_lo[i] <= j < j_lo[i] + len(rows[i])``,
+    which is the band ``|(n - i) - (m - j)| <= w`` clipped to
+    ``[0, m]``.  Cells outside the band read as :data:`_INF`.  Boundary
+    cells (last row, last column) inside the band are exact, and every
+    cell whose true cost is at most ``w`` gets the exact value (the
+    recurrence can only reach neighbours of no larger cost), which is
+    all the greedy walk ever reads.
+    """
+    base = m - n
+    j_lo = []
+    rows = []
+    for i in range(n + 1):
+        lo = base + i - w
+        if lo < 0:
+            lo = 0
+        hi = base + i + w
+        if hi > m:
+            hi = m
+        j_lo.append(lo)
+        rows.append(array("i", [0]) * (hi - lo + 1))
+    # Boundary: last row, and the last column where the band reaches it.
+    last = rows[n]
+    lo = j_lo[n]
+    for j in range(lo, m + 1):
+        last[j - lo] = m - j
+    for i in range(n):
+        if base + i + w >= m:
+            rows[i][m - j_lo[i]] = n - i
+    # Fill bottom-up, right-to-left with the unit-cost recurrence.
+    for i in range(n - 1, -1, -1):
+        row, nxt = rows[i], rows[i + 1]
+        lo, nlo = j_lo[i], j_lo[i + 1]
+        hi = lo + len(row) - 1
+        nlen = len(nxt)
+        ai = a[lo_n + i]
+        jmax = hi if hi < m else m - 1  # column m is a boundary cell
+        for j in range(jmax, lo - 1, -1):
+            pair = 0 if ai == b[lo_m + j] else 1
+            t = j + 1 - nlo
+            diag = nxt[t] + pair if 0 <= t < nlen else _INF
+            t = j - nlo
+            dele = nxt[t] + 1 if 0 <= t < nlen else _INF
+            t = j + 1 - lo
+            ins = row[t] + 1 if t < len(row) else _INF
+            row[j - lo] = min(diag, dele, ins)
+    return rows, j_lo
+
+
+def _cell(rows, j_lo, i, j):
+    """Banded table lookup; cells outside the band read as :data:`_INF`."""
+    t = j - j_lo[i]
+    if 0 <= t < len(rows[i]):
+        return rows[i][t]
+    return _INF
+
+
+def _walk(a, b, lo_n, lo_m, n, m, rows, j_lo):
+    """Greedy walk over the suffix-cost table, tie-broken per position.
+
+    Takes the first operation in the ``match > substitute > delete >
+    insert`` order whose remainder realizes the optimal total, exactly
+    as the full-table walk does; banded-out cells read as :data:`_INF`
+    and are never chosen.
+    """
     ops = []
     i = j = 0
     while i < n or j < m:
@@ -175,10 +322,10 @@ def _align_core(a, b, lo_n, hi_n, lo_m, hi_m):
             candidates.append((DELETE, i + 1, j, i, None))
         if j < m:
             candidates.append((INSERT, i, j + 1, None, j))
-        total = rest[i][j]
+        total = _cell(rows, j_lo, i, j)
         chosen = None
         for opname, ni, nj, oi, nj2 in candidates:
-            if _OP_COST[opname] + rest[ni][nj] == total:
+            if _OP_COST[opname] + _cell(rows, j_lo, ni, nj) == total:
                 chosen = (opname, oi, nj2)
                 break
         assert chosen is not None

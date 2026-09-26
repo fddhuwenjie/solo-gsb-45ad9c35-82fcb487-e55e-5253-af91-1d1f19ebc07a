@@ -9,15 +9,80 @@ import threading
 import unittest
 import urllib.request
 
+import app.diff as diff_module
 from app.diff import (
     BODY_DELETED, BODY_INSERTED, BODY_SUBSTITUTED, DELETE, INSERT, MATCH,
-    PAGINATION_SHIFT, RETRANSLATED, SUBSTITUTE, UNCHANGED, _align_core,
-    align_graphemes, compare_finalizations, grapheme_slots,
+    PAGINATION_SHIFT, RETRANSLATED, SUBSTITUTE, UNCHANGED, _OP_COST,
+    _align_core, align_graphemes, compare_finalizations, grapheme_slots,
 )
 from app.errors import InputError
 from app.graphemes import graphemes
 from app.planner import plan
 from app.server import build_server, get_store
+
+
+def _reference_align_core(a, b, lo_n, hi_n, lo_m, hi_m):
+    """The pre-banding full-table suffix DP + greedy walk (reference).
+
+    Kept verbatim from the original ``_align_core`` so the banded
+    production implementation can be checked operation-for-operation
+    against the untrimmed quadratic algorithm on small inputs.
+    """
+    n, m = hi_n - lo_n, hi_m - lo_m
+    rest = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        rest[i][m] = n - i
+    for j in range(m + 1):
+        rest[n][j] = m - j
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            pair = 0 if a[lo_n + i] == b[lo_m + j] else 1
+            rest[i][j] = min(rest[i + 1][j + 1] + pair,
+                             rest[i + 1][j] + 1, rest[i][j + 1] + 1)
+    ops = []
+    i = j = 0
+    while i < n or j < m:
+        candidates = []
+        if i < n and j < m:
+            op = MATCH if a[lo_n + i] == b[lo_m + j] else SUBSTITUTE
+            candidates.append((op, i + 1, j + 1, i, j))
+        if i < n:
+            candidates.append((DELETE, i + 1, j, i, None))
+        if j < m:
+            candidates.append((INSERT, i, j + 1, None, j))
+        total = rest[i][j]
+        chosen = None
+        for opname, ni, nj, oi, nj2 in candidates:
+            if _OP_COST[opname] + rest[ni][nj] == total:
+                chosen = (opname, oi, nj2)
+                break
+        assert chosen is not None
+        opname, oi, ni = chosen
+        ops.append((opname,
+                    None if oi is None else lo_n + oi,
+                    None if ni is None else lo_m + ni))
+        if opname in (MATCH, SUBSTITUTE, DELETE):
+            i += 1
+        if opname in (MATCH, SUBSTITUTE, INSERT):
+            j += 1
+    return ops
+
+
+def _mutate(rng, text, alphabet, edits):
+    """Apply up to ``edits`` random single-character edits."""
+    chars = list(text)
+    for _ in range(edits):
+        if not chars:
+            break
+        kind = rng.randrange(3)
+        pos = rng.randrange(len(chars))
+        if kind == 0:
+            chars[pos] = rng.choice(alphabet)
+        elif kind == 1:
+            del chars[pos]
+        else:
+            chars.insert(pos, rng.choice(alphabet))
+    return "".join(chars)
 
 
 def _rev(no, body, cpl=12, lpp=3, rules=None):
@@ -107,9 +172,140 @@ class AlignmentTests(unittest.TestCase):
                 trimmed = align_graphemes(graphemes(old), graphemes(new))
                 old_t = [c[0] for c in graphemes(old)]
                 new_t = [c[0] for c in graphemes(new)]
-                reference = _align_core(old_t, new_t,
-                                        0, len(old_t), 0, len(new_t))
+                reference = _reference_align_core(old_t, new_t,
+                                                  0, len(old_t), 0,
+                                                  len(new_t))
                 self.assertEqual(trimmed, reference, (old, new))
+
+
+class BandedAlignmentTests(unittest.TestCase):
+    """The exact diagonal-band DP behind oversized middles.
+
+    ``MAX_TABLE_CELLS`` is patched down so that small inputs take the
+    banded path (with band doubling) instead of the full-table fast
+    path; the emitted stream must still equal the full-table reference.
+    """
+
+    def setUp(self):
+        self._saved_limit = diff_module.MAX_TABLE_CELLS
+        diff_module.MAX_TABLE_CELLS = 400
+
+    def tearDown(self):
+        diff_module.MAX_TABLE_CELLS = self._saved_limit
+
+    def test_banded_core_matches_full_table_reference(self):
+        # Bounded-edit pairs keep the edit distance <= 3, so the band
+        # stays within the patched limit while n*m exceeds it.
+        rng = random.Random(20260926)
+        for alphabet in ("ab", "aab", "ab́"):
+            for _ in range(400):
+                old = "".join(rng.choice(alphabet)
+                              for _ in range(rng.randrange(18, 31)))
+                new = _mutate(rng, old, alphabet, rng.randrange(4))
+                old_t = [c[0] for c in graphemes(old)]
+                new_t = [c[0] for c in graphemes(new)]
+                reference = _reference_align_core(old_t, new_t,
+                                                  0, len(old_t), 0,
+                                                  len(new_t))
+                self.assertEqual(
+                    _align_core(old_t, new_t, 0, len(old_t), 0,
+                                len(new_t)),
+                    reference, (old, new))
+                self.assertEqual(
+                    align_graphemes(graphemes(old), graphemes(new)),
+                    reference, (old, new))
+
+    def test_band_doubling_until_exact(self):
+        # "ab"*15 vs "ba"*15 has edit distance 2 with equal grapheme
+        # counts, so the lower bound starts at 1 and must double once.
+        old_t = [c[0] for c in graphemes("ab" * 15)]
+        new_t = [c[0] for c in graphemes("ba" * 15)]
+        self.assertEqual(
+            _align_core(old_t, new_t, 0, len(old_t), 0, len(new_t)),
+            _reference_align_core(old_t, new_t, 0, len(old_t), 0,
+                                  len(new_t)))
+
+    def test_near_identical_long_middle_accepted(self):
+        # 40 x 40 exceeds the patched full-table limit, but the edit
+        # distance is 1, so a 1-wide band suffices.
+        ops = align_graphemes(graphemes("a" * 40),
+                              graphemes("c" + "a" * 39))
+        self.assertEqual(ops[0], (SUBSTITUTE, 0, 0))
+        self.assertEqual(ops[1:], [(MATCH, i, i) for i in range(1, 40)])
+
+    def test_divergent_input_still_rejected(self):
+        with self.assertRaises(InputError):
+            align_graphemes(graphemes("a" * 40), graphemes("b" * 40))
+
+
+class LongRevisionTests(unittest.TestCase):
+    """Long repeated bodies whose middles exceed the full-table limit."""
+
+    def test_long_repeated_body_first_char_change(self):
+        # The reported false rejection: 3163 x "a" vs "c" + 3162 x "a".
+        # Both bodies are far below the grapheme limit, but the
+        # common-suffix guard cannot trim (the suffix texts reappear in
+        # the middles), so the untrimmed table would need
+        # 3163 x 3163 > MAX_TABLE_CELLS cells.  The edit distance is 1,
+        # so the banded alignment finishes inside a 1-wide band with
+        # exactly the stream the full DP would emit.
+        ops = align_graphemes(graphemes("a" * 3163),
+                              graphemes("c" + "a" * 3162))
+        self.assertEqual(ops[0], (SUBSTITUTE, 0, 0))
+        self.assertEqual(ops[1:], [(MATCH, i, i) for i in range(1, 3163)])
+
+    def test_long_repeated_body_head_insertion(self):
+        ops = align_graphemes(graphemes("a" * 3163),
+                              graphemes("c" + "a" * 3163))
+        self.assertEqual(ops[0], (INSERT, None, 0))
+        self.assertEqual(ops[1:], [(MATCH, i, i + 1) for i in range(3163)])
+
+    def test_long_repeated_body_delete_head_insert_tail(self):
+        # Edit distance 2 over a 4000 x 4000 middle: the band must be
+        # doubled once; the stream matches the small-scale reference
+        # shape (deletion at the head, insertion at the tail).
+        ops = align_graphemes(graphemes("ab" * 2000),
+                              graphemes("ba" * 2000))
+        self.assertEqual(ops[0], (DELETE, 0, None))
+        self.assertEqual(ops[-1], (INSERT, None, 3999))
+        self.assertEqual(ops[1:-1],
+                         [(MATCH, i, i - 1) for i in range(1, 4000)])
+
+    def test_divergent_long_bodies_still_rejected(self):
+        with self.assertRaises(InputError):
+            align_graphemes(graphemes("a" * 4000), graphemes("b" * 4000))
+
+    def test_long_near_identical_compare_end_to_end(self):
+        # Same shape as the reported case but plannable (one-letter
+        # words): 3163 graphemes per side, only the first differs.
+        old_body = "a " * 1581 + "a"
+        new_body = "c" + old_body[1:]
+        self.assertEqual(len(graphemes(old_body)), 3163)
+        self.assertEqual(len(graphemes(new_body)), 3163)
+        r1 = rev(1, old_body)
+        r2 = rev(2, new_body)
+        rep = compare_finalizations(r1, r2)
+        self.assertFalse(rep["identical"])
+        self.assertEqual(rep["edit_cost"], 1)
+        self.assertEqual(rep["counts"][BODY_SUBSTITUTED], 1)
+        self.assertEqual(rep["counts"][UNCHANGED], 3162)
+        self.assertEqual(rep["change_count"], 1)
+        self.assertEqual(len(rep["segments"]), 1)
+        seg = rep["segments"][0]
+        self.assertEqual(seg["kinds"], [BODY_SUBSTITUTED])
+        self.assertEqual(seg["mark_count"], 1)
+        self.assertEqual(seg["old_char_start"], 0)
+        self.assertEqual(seg["old_char_end"], 1)
+        self.assertEqual(seg["new_char_start"], 0)
+        self.assertEqual(seg["new_char_end"], 1)
+        self.assertEqual(seg["old_page_range"], {"start": 1, "end": 1})
+        self.assertEqual(seg["new_page_range"], {"start": 1, "end": 1})
+        self.assertEqual(rep["old_affected_pages"],
+                         {"content_changed": [1], "cascade_reflow": [],
+                          "count": 1})
+        self.assertEqual(rep["new_reemboss_pages"],
+                         {"content_changed": [1], "cascade_reflow": [],
+                          "count": 1})
 
 
 class CompareTests(unittest.TestCase):
